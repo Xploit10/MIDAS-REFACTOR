@@ -1,0 +1,187 @@
+# MIDAS Early-Exit Network Configuration
+
+# Data configuration
+data:
+  # Path to netflow dataset CSV
+  data_path: "data/netflow.csv"
+
+  # Or use pre-split data
+  # train_path: "data/train.csv"
+  # val_path: "data/val.csv"
+  # test_path: "data/test.csv"
+
+  # Target column name in CSV
+  target_column: "label"
+
+  # Train/val/test split ratios
+  test_size: 0.2
+  val_size: 0.1
+
+  # Feature normalization
+  normalize: true
+
+  # Batch size
+  batch_size: 256
+
+  # Random seed
+  random_seed: 42
+
+# Model architecture
+model:
+  # Network type: "mlp" or "attention"
+  type: "mlp"
+
+  # Input dimension (auto-detected from data if not specified)
+  # input_dim: 100
+
+  # Hidden layer dimensions
+  hidden_dims: [128, 256, 512, 256, 128]
+
+  # Exit layer indices (0-indexed, must be < len(hidden_dims))
+  exit_layers: [1, 3, 4]
+
+  # Number of output classes
+  num_classes: 2
+
+  # Dropout rates
+  dropout: 0.2
+  exit_dropout: 0.1
+
+# Routing module configuration
+routing:
+  # Routing type: "mlp", "attention", or "none" (for oracle baselines)
+  type: "attention"
+
+  # Feature dimension for routing (auto-detected from model)
+  # feature_dim: 256
+
+  # Routing network hidden dimension
+  hidden_dim: 64
+
+  # For attention routing
+  num_heads: 4
+  num_layers: 2
+
+  # Temperature for probability scaling
+  temperature: 1.0
+
+  # Context dimension (for running statistics)
+  context_dim: 8
+
+# Cost model configuration
+cost:
+  # Cost type: "layer_depth", "exponential", "flops", "latency", "composite"
+  type: "layer_depth"
+
+  # Layer-specific costs (for layer_depth type)
+  cost_per_layer: [1.0, 2.0, 3.0, 4.0, 5.0]
+
+  # For exponential cost
+  # base: 1.5
+  # offset: 1.0
+
+  # Cost penalty weight in reward function
+  lambda: 0.1
+
+# Training configuration
+training:
+  # Number of training epochs
+  epochs: 50
+
+  # Learning rates
+  lr_classifier: 0.001
+  lr_routing: 0.0005
+
+  # Optimizer
+  optimizer: "adamw"
+  weight_decay: 0.0001
+
+  # Learning rate schedule
+  scheduler: "cosine"  # "cosine", "step", or "none"
+
+  # Loss weights
+  exit_loss_weights: [0.3, 0.5, 1.0]  # Weight for each exit's classification loss
+  routing_loss_weight: 1.0
+
+  # RL training
+  rl:
+    # Advantage estimation
+    advantage_beta: 0.99
+
+    # Entropy regularization
+    entropy_coef: 0.01
+
+    # Warmup epochs (train classifier only, no routing)
+    warmup_epochs: 10
+
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 10
+    metric: "val_accuracy"  # "val_accuracy" or "val_cost_accuracy"
+
+  # Gradient clipping
+  grad_clip: 1.0
+
+  # Device
+  device: "cuda"  # "cuda", "cpu", or "mps"
+
+# Evaluation configuration
+evaluation:
+  # Oracle baselines to compare against
+  oracle_baselines:
+    - "always_exit_0"  # Always use first exit
+    - "always_exit_1"  # Always use second exit
+    - "always_final"   # Always use final exit
+    - "random"         # Random exit selection
+    - "confidence"     # Exit when confidence > threshold
+
+  # Confidence threshold for confidence-based oracle
+  confidence_threshold: 0.9
+
+  # Metrics to compute
+  metrics:
+    - "accuracy"
+    - "per_exit_accuracy"
+    - "exit_usage"
+    - "avg_cost"
+    - "accuracy_per_cost"
+    - "cost_accuracy_tradeoff"
+
+# Weights & Biases configuration
+wandb:
+  enabled: true
+  project: "MIDAS-netflow"
+  entity: null  # Set to your W&B username/team
+
+  # Run name (auto-generated if null)
+  run_name: null
+
+  # Tags for organizing runs
+  tags:
+    - "early-exit"
+    - "netflow"
+    - "rl-routing"
+
+  # Log frequency
+  log_interval: 10  # Log every N batches
+
+  # Save model checkpoints to W&B
+  save_checkpoints: true
+
+# Experiment configuration (for hyperparameter sweeps)
+experiment:
+  # Sweep parameters (optional, for W&B sweeps)
+  sweep:
+    enabled: false
+    method: "bayes"  # "grid", "random", or "bayes"
+
+    parameters:
+      cost.lambda:
+        values: [0.05, 0.1, 0.15, 0.2]
+
+      routing.type:
+        values: ["mlp", "attention"]
+
+      training.lr_routing:
+        values: [0.0001, 0.0005, 0.001]
