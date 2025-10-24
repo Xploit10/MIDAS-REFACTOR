@@ -8,7 +8,7 @@ balancing classification accuracy against computational cost.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple
+from typing import Dict, Tuple
 
 
 class RoutingModule(nn.Module):
@@ -20,35 +20,42 @@ class RoutingModule(nn.Module):
         reward = correct_prediction - cost_penalty * layer_depth
 
     Args:
-        feature_dim: Dimension of input features from backbone layers
+        feature_dims: Mapping from exit layer index to feature dimension
         hidden_dim: Hidden layer size for routing network
-        num_exits: Total number of exit points
         context_dim: Dimension of additional context (e.g., running statistics)
         temperature: Temperature for probability scaling
     """
 
     def __init__(
         self,
-        feature_dim: int,
+        feature_dims: Dict[int, int],
         hidden_dim: int = 64,
-        num_exits: int = 3,
         context_dim: int = 8,
         temperature: float = 1.0,
     ):
         super().__init__()
-        self.feature_dim = feature_dim
+        if not feature_dims:
+            raise ValueError("feature_dims must provide at least one exit layer dimension")
+
         self.hidden_dim = hidden_dim
-        self.num_exits = num_exits
         self.temperature = temperature
+        self.context_dim = context_dim
+        self.exit_layers = sorted(feature_dims.keys())
+        self.num_exits = len(self.exit_layers)
 
-        # Embed layer index
-        self.layer_embedding = nn.Embedding(num_exits, hidden_dim)
+        # Embed actual layer index (supports non-contiguous exit layers)
+        self.layer_embedding = nn.Embedding(max(self.exit_layers) + 1, hidden_dim)
 
-        # Feature encoder
-        self.feature_encoder = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim),
-            nn.ReLU(),
-            nn.LayerNorm(hidden_dim),
+        # Feature encoders per exit (handle varying feature dims)
+        self.feature_encoders = nn.ModuleDict(
+            {
+                str(layer_idx): nn.Sequential(
+                    nn.Linear(dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.LayerNorm(hidden_dim),
+                )
+                for layer_idx, dim in feature_dims.items()
+            }
         )
 
         # Context encoder (for running cost/accuracy statistics)
@@ -57,9 +64,11 @@ class RoutingModule(nn.Module):
             nn.ReLU(),
         )
 
+        combined_dim = hidden_dim + (hidden_dim // 2) + hidden_dim
+
         # Policy head (outputs exit probability)
         self.policy_head = nn.Sequential(
-            nn.Linear(hidden_dim + hidden_dim // 2 + hidden_dim, hidden_dim),
+            nn.Linear(combined_dim, hidden_dim),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, 1),
@@ -84,17 +93,27 @@ class RoutingModule(nn.Module):
         """
         batch_size = features.shape[0]
 
-        # Encode features
-        feat_encoded = self.feature_encoder(features)
+        # Encode features using the exit-specific encoder
+        encoder_key = str(layer_idx)
+        if encoder_key not in self.feature_encoders:
+            raise ValueError(f"No feature encoder registered for exit layer {layer_idx}")
+        feat_encoded = self.feature_encoders[encoder_key](features)
 
         # Encode layer position
-        layer_tensor = torch.tensor([layer_idx], device=features.device)
+        layer_tensor = torch.full(
+            (batch_size,), layer_idx, device=features.device, dtype=torch.long
+        )
         layer_encoded = self.layer_embedding(layer_tensor)
-        layer_encoded = layer_encoded.expand(batch_size, -1)
 
         # Encode context (or use zeros)
         if context is None:
-            context = torch.zeros(batch_size, 8, device=features.device)
+            context = torch.zeros(
+                batch_size, self.context_dim, device=features.device, dtype=features.dtype
+            )
+        elif context.shape[-1] != self.context_dim:
+            raise ValueError(
+                f"Expected context dimension {self.context_dim}, got {context.shape[-1]}"
+            )
         ctx_encoded = self.context_encoder(context)
 
         # Concatenate all inputs
@@ -143,37 +162,43 @@ class AttentionRoutingModule(nn.Module):
     for the RL-based early-exit framework.
 
     Args:
-        feature_dim: Dimension of input features
+        feature_dims: Mapping from exit layer index to feature dimension
         hidden_dim: Transformer hidden dimension
         num_heads: Number of attention heads
         num_layers: Number of transformer blocks
-        num_exits: Total number of exit points
         temperature: Temperature for probability scaling
     """
 
     def __init__(
         self,
-        feature_dim: int,
+        feature_dims: Dict[int, int],
         hidden_dim: int = 64,
         num_heads: int = 4,
         num_layers: int = 2,
-        num_exits: int = 3,
         temperature: float = 1.0,
     ):
         super().__init__()
-        self.feature_dim = feature_dim
+        if not feature_dims:
+            raise ValueError("feature_dims must provide at least one exit layer dimension")
+
         self.hidden_dim = hidden_dim
         self.temperature = temperature
-        self.num_exits = num_exits
+        self.exit_layers = sorted(feature_dims.keys())
+        self.num_exits = len(self.exit_layers)
 
         # Import transformer block from existing attention_router
         from models.attention_router import _TransformerBlock
 
-        # Feature projection
-        self.feature_proj = nn.Linear(feature_dim, hidden_dim)
+        # Feature projections per exit
+        self.feature_projs = nn.ModuleDict(
+            {
+                str(layer_idx): nn.Linear(dim, hidden_dim)
+                for layer_idx, dim in feature_dims.items()
+            }
+        )
 
-        # Layer embedding
-        self.layer_embedding = nn.Embedding(num_exits, hidden_dim)
+        # Layer embedding supports actual layer indices
+        self.layer_embedding = nn.Embedding(max(self.exit_layers) + 1, hidden_dim)
 
         # Positional encoding for two tokens
         self.positional = nn.Parameter(torch.randn(1, 2, hidden_dim) * 0.02)
@@ -208,16 +233,23 @@ class AttentionRoutingModule(nn.Module):
         Returns:
             Exit probability (batch_size,)
         """
-        batch_size = features.shape[0]
+        del context  # Unused in this variant
 
-        # Project features
-        feat_primary = self.feature_proj(features)
-        feat_interact = self.feature_proj(features ** 2)
+        batch_size = features.shape[0]
+        proj_key = str(layer_idx)
+        if proj_key not in self.feature_projs:
+            raise ValueError(f"No feature projection registered for exit layer {layer_idx}")
+        feature_proj = self.feature_projs[proj_key]
+
+        # Project features (use same projection for interaction term)
+        feat_primary = feature_proj(features)
+        feat_interact = feature_proj(features**2)
 
         # Encode layer position
-        layer_tensor = torch.tensor([layer_idx], device=features.device)
+        layer_tensor = torch.full(
+            (batch_size,), layer_idx, device=features.device, dtype=torch.long
+        )
         layer_encoded = self.layer_embedding(layer_tensor)
-        layer_encoded = layer_encoded.unsqueeze(0).expand(batch_size, -1)
 
         # Create two tokens: primary features + layer, interaction features + layer
         token1 = feat_primary + layer_encoded

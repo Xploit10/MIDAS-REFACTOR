@@ -2,6 +2,15 @@
 
 MIDAS is a cost-optimized deep learning framework for netflow classification that uses **early-exit architectures** with **reinforcement learning-based routing** to balance accuracy against computational cost.
 
+If you want actionable instructions, jump to Quick Start below. For deeper explanations and per-component guides, see the docs/ directory:
+- docs/overview.md — concepts and workflow
+- docs/training.md — how training works and what gets optimized
+- docs/evaluation.md — how to evaluate and compare baselines
+- docs/model.md — backbone and exits
+- docs/routing.md — policy, reward, and sampling
+- docs/costs.md — cost models and interpretation
+- docs/results.md — reading metrics and verifying savings
+
 ## Overview
 
 Traditional deep networks process all inputs through all layers, wasting computation on "easy" samples. MIDAS embeds multiple exit points throughout the network, allowing simple samples to exit early while complex samples continue to deeper layers.

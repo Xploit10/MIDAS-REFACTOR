@@ -2,3 +2,5 @@
 *DS_Store
 .claude/
 MachineLearningCVE/
+*.pt
+.venv/

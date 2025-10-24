@@ -51,23 +51,23 @@ def create_model(config: dict, input_dim: int) -> tuple:
 
     # Create routing module
     routing_type = config["routing"]["type"]
-    feature_dim = config["model"]["hidden_dims"][config["model"]["exit_layers"][0]]
+    exit_feature_dims = {
+        layer_idx: network.hidden_dims[layer_idx] for layer_idx in network.exit_layers
+    }
 
     if routing_type == "mlp":
         routing_module = RoutingModule(
-            feature_dim=feature_dim,
+            feature_dims=exit_feature_dims,
             hidden_dim=config["routing"]["hidden_dim"],
-            num_exits=len(config["model"]["exit_layers"]),
             context_dim=config["routing"]["context_dim"],
             temperature=config["routing"]["temperature"],
         )
     elif routing_type == "attention":
         routing_module = AttentionRoutingModule(
-            feature_dim=feature_dim,
+            feature_dims=exit_feature_dims,
             hidden_dim=config["routing"]["hidden_dim"],
             num_heads=config["routing"]["num_heads"],
             num_layers=config["routing"]["num_layers"],
-            num_exits=len(config["model"]["exit_layers"]),
             temperature=config["routing"]["temperature"],
         )
     elif routing_type == "none":
@@ -241,6 +241,7 @@ def validate(
 
     exit_stats = ExitStatistics(num_exits=len(config["model"]["exit_layers"]))
     cost_per_layer = config["cost"]["cost_per_layer"]
+    max_cost = sum(cost_per_layer)
 
     total_samples = 0
     total_correct = 0
@@ -301,6 +302,9 @@ def validate(
 
     # Get metrics
     metrics = exit_stats.get_metrics()
+    # Add normalized average cost for clarity
+    if metrics.get("avg_cost") is not None and max_cost > 0:
+        metrics["avg_cost_normalized"] = metrics["avg_cost"] / max_cost
     metrics = {f"val_{k}": v for k, v in metrics.items()}
 
     return metrics
@@ -470,6 +474,37 @@ def main():
     # Create cost model
     cost_model = get_cost_model(config["cost"])
 
+    # Print cost profile for transparency
+    cost_per_layer = config["cost"].get("cost_per_layer")
+    if cost_per_layer:
+        cumulative = []
+        total = 0.0
+        for c in cost_per_layer:
+            total += c
+            cumulative.append(total)
+        print("\nCost profile (per-layer and cumulative):")
+        print(f"  per-layer:   {cost_per_layer}")
+        print(f"  cumulative:  {cumulative}")
+        print(f"  max_cost:    {sum(cost_per_layer):.4f}")
+
+    # Optional: print a FLOPs profile derived from architecture
+    if config["cost"].get("print_flops_profile", False):
+        layer_dims = [input_dim] + network.hidden_dims
+        flops_per_layer = []
+        cum_flops = []
+        t = 0
+        for i in range(len(layer_dims) - 1):
+            in_dim = layer_dims[i]
+            out_dim = layer_dims[i + 1]
+            fl = 2 * in_dim * out_dim
+            flops_per_layer.append(fl)
+            t += fl
+            cum_flops.append(t)
+        print("\nFLOPs profile (approx FC only):")
+        print(f"  per-layer:   {flops_per_layer}")
+        print(f"  cumulative:  {cum_flops}")
+        print(f"  total FLOPs: {t:,}\n")
+
     # Create RL trainer
     advantage_estimator = AdvantageEstimator(beta=config["training"]["rl"]["advantage_beta"])
     rl_trainer = REINFORCETrainer(
@@ -527,7 +562,13 @@ def main():
         print(f"\nEpoch {epoch}:")
         print(f"  Train Loss: {train_metrics['train_loss']:.4f}")
         print(f"  Val Accuracy: {val_metrics.get('val_overall_accuracy', 0):.4f}")
-        print(f"  Val Avg Cost: {val_metrics.get('val_avg_cost', 0):.4f}")
+        if 'val_avg_cost' in val_metrics:
+            if 'val_avg_cost_normalized' in val_metrics:
+                print(
+                    f"  Val Avg Cost: {val_metrics['val_avg_cost']:.4f} (norm={val_metrics['val_avg_cost_normalized']:.4f})"
+                )
+            else:
+                print(f"  Val Avg Cost: {val_metrics['val_avg_cost']:.4f}")
 
         # Log to W&B
         if config["wandb"]["enabled"]:
@@ -542,8 +583,13 @@ def main():
                 best_val_metric = current_metric
                 patience_counter = 0
 
-                # Save best model
-                best_checkpoint_path = checkpoint_dir / "baseline_best.pt"
+                # Save best model (avoid overwriting baseline by default)
+                checkpoint_name = config["training"].get("checkpoint_name")
+                if not checkpoint_name:
+                    checkpoint_name = (
+                        "routing_best.pt" if routing_module is not None else "baseline_best.pt"
+                    )
+                best_checkpoint_path = checkpoint_dir / checkpoint_name
                 save_checkpoint(
                     network=network,
                     routing_module=routing_module,

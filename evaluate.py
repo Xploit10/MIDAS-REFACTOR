@@ -25,9 +25,15 @@ def load_model(checkpoint_path: str, device: str):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     config = checkpoint["config"]
 
-    # Get input dimension from checkpoint or config
-    sample_state = list(checkpoint["network"].values())[0]
-    input_dim = checkpoint["network"]["backbone_layers.0.0.weight"].shape[1]
+    # Get input dimension from checkpoint state dict
+    net_sd = checkpoint.get("network_state_dict") or checkpoint.get("network")
+    if net_sd is None:
+        raise KeyError("Checkpoint missing network state dict")
+    first_layer_key = "backbone_layers.0.0.weight"
+    if first_layer_key not in net_sd:
+        # Try alternate key for robustness
+        first_layer_key = next(k for k in net_sd.keys() if k.endswith(".0.weight"))
+    input_dim = net_sd[first_layer_key].shape[1]
 
     # Recreate network
     network = NetflowNetwork(
@@ -38,34 +44,36 @@ def load_model(checkpoint_path: str, device: str):
         dropout=config["model"]["dropout"],
         exit_dropout=config["model"]["exit_dropout"],
     )
-    network.load_state_dict(checkpoint["network"])
+    network.load_state_dict(net_sd)
     network = network.to(device)
 
     # Recreate routing module if present
     routing_module = None
-    if checkpoint.get("routing_module") is not None:
+    if checkpoint.get("routing_module_state_dict") is not None or checkpoint.get("routing_module") is not None:
         routing_type = config["routing"]["type"]
-        feature_dim = config["model"]["hidden_dims"][config["model"]["exit_layers"][0]]
+        exit_feature_dims = {
+            layer_idx: network.hidden_dims[layer_idx] for layer_idx in network.exit_layers
+        }
 
         if routing_type == "mlp":
             routing_module = RoutingModule(
-                feature_dim=feature_dim,
+                feature_dims=exit_feature_dims,
                 hidden_dim=config["routing"]["hidden_dim"],
-                num_exits=len(config["model"]["exit_layers"]),
                 context_dim=config["routing"]["context_dim"],
                 temperature=config["routing"]["temperature"],
             )
         elif routing_type == "attention":
             routing_module = AttentionRoutingModule(
-                feature_dim=feature_dim,
+                feature_dims=exit_feature_dims,
                 hidden_dim=config["routing"]["hidden_dim"],
                 num_heads=config["routing"]["num_heads"],
                 num_layers=config["routing"]["num_layers"],
-                num_exits=len(config["model"]["exit_layers"]),
                 temperature=config["routing"]["temperature"],
             )
 
-        routing_module.load_state_dict(checkpoint["routing_module"])
+        # Accept both new and legacy keys
+        routing_sd = checkpoint.get("routing_module_state_dict") or checkpoint.get("routing_module")
+        routing_module.load_state_dict(routing_sd)
         routing_module = routing_module.to(device)
 
     return network, routing_module, config
@@ -74,7 +82,7 @@ def load_model(checkpoint_path: str, device: str):
 def evaluate_oracle_always_exit(
     network: nn.Module,
     test_loader,
-    exit_idx: int,
+    exit_layer: int,
     cost_per_layer: list,
     device: str,
 ) -> dict:
@@ -101,16 +109,17 @@ def evaluate_oracle_always_exit(
 
             # Get predictions at specific exit
             _, exit_data = network(features, return_all_exits=True)
-            logits = exit_data[f"logits_{exit_idx}"]
+            logits = exit_data[f"logits_{exit_layer}"]
             predictions = logits.argmax(dim=-1)
 
             # Compute cost
-            cost = sum(cost_per_layer[: exit_idx + 1])
+            cost = sum(cost_per_layer[: exit_layer + 1])
 
             # Update statistics
             for i in range(len(labels)):
                 is_correct = bool(predictions[i] == labels[i])
-                exit_stats.update(exit_idx, is_correct, cost)
+                pos_idx = network.exit_layers.index(exit_layer)
+                exit_stats.update(pos_idx, is_correct, cost)
 
     return exit_stats.get_metrics()
 
@@ -137,15 +146,16 @@ def evaluate_oracle_random(
             _, exit_data = network(features, return_all_exits=True)
 
             for i in range(len(labels)):
-                # Randomly select exit
-                exit_idx = rng.choice(network.exit_layers)
+                # Randomly select exit layer id
+                exit_layer = int(rng.choice(network.exit_layers))
 
-                logits = exit_data[f"logits_{exit_idx}"][i : i + 1]
+                logits = exit_data[f"logits_{exit_layer}"][i : i + 1]
                 prediction = logits.argmax(dim=-1)
                 is_correct = bool(prediction == labels[i])
 
-                cost = sum(cost_per_layer[: exit_idx + 1])
-                exit_stats.update(exit_idx, is_correct, cost)
+                cost = sum(cost_per_layer[: exit_layer + 1])
+                pos_idx = network.exit_layers.index(exit_layer)
+                exit_stats.update(pos_idx, is_correct, cost)
 
     return exit_stats.get_metrics()
 
@@ -174,29 +184,31 @@ def evaluate_oracle_confidence(
                 exited = False
 
                 # Try each exit in order
-                for exit_idx in network.exit_layers[:-1]:
-                    logits = exit_data[f"logits_{exit_idx}"][i : i + 1]
+                for exit_layer in network.exit_layers[:-1]:
+                    logits = exit_data[f"logits_{exit_layer}"][i : i + 1]
                     probs = torch.softmax(logits, dim=-1)
                     confidence = probs.max().item()
 
                     if confidence > threshold:
                         prediction = logits.argmax(dim=-1)
                         is_correct = bool(prediction == labels[i])
-                        cost = sum(cost_per_layer[: exit_idx + 1])
+                        cost = sum(cost_per_layer[: exit_layer + 1])
 
-                        exit_stats.update(exit_idx, is_correct, cost)
+                        pos_idx = network.exit_layers.index(exit_layer)
+                        exit_stats.update(pos_idx, is_correct, cost)
                         exited = True
                         break
 
                 if not exited:
                     # Use final exit
-                    final_idx = network.exit_layers[-1]
-                    logits = exit_data[f"logits_{final_idx}"][i : i + 1]
+                    final_layer = network.exit_layers[-1]
+                    logits = exit_data[f"logits_{final_layer}"][i : i + 1]
                     prediction = logits.argmax(dim=-1)
                     is_correct = bool(prediction == labels[i])
-                    cost = sum(cost_per_layer[: final_idx + 1])
+                    cost = sum(cost_per_layer[: final_layer + 1])
 
-                    exit_stats.update(final_idx, is_correct, cost)
+                    pos_idx = network.exit_layers.index(final_layer)
+                    exit_stats.update(pos_idx, is_correct, cost)
 
     return exit_stats.get_metrics()
 
@@ -226,29 +238,31 @@ def evaluate_learned_routing(
                 exited = False
 
                 # Try each exit with routing module
-                for exit_idx in network.exit_layers[:-1]:
-                    features_at_exit = exit_data[f"features_{exit_idx}"][i : i + 1]
-                    exit_prob = routing_module(features_at_exit, exit_idx, context=None)
+                for exit_layer in network.exit_layers[:-1]:
+                    features_at_exit = exit_data[f"features_{exit_layer}"][i : i + 1]
+                    exit_prob = routing_module(features_at_exit, exit_layer, context=None)
 
                     if exit_prob > 0.5:
-                        logits = exit_data[f"logits_{exit_idx}"][i : i + 1]
+                        logits = exit_data[f"logits_{exit_layer}"][i : i + 1]
                         prediction = logits.argmax(dim=-1)
                         is_correct = bool(prediction == labels[i])
-                        cost = sum(cost_per_layer[: exit_idx + 1])
+                        cost = sum(cost_per_layer[: exit_layer + 1])
 
-                        exit_stats.update(exit_idx, is_correct, cost)
+                        pos_idx = network.exit_layers.index(exit_layer)
+                        exit_stats.update(pos_idx, is_correct, cost)
                         exited = True
                         break
 
                 if not exited:
                     # Use final exit
-                    final_idx = network.exit_layers[-1]
-                    logits = exit_data[f"logits_{final_idx}"][i : i + 1]
+                    final_layer = network.exit_layers[-1]
+                    logits = exit_data[f"logits_{final_layer}"][i : i + 1]
                     prediction = logits.argmax(dim=-1)
                     is_correct = bool(prediction == labels[i])
-                    cost = sum(cost_per_layer[: final_idx + 1])
+                    cost = sum(cost_per_layer[: final_layer + 1])
 
-                    exit_stats.update(final_idx, is_correct, cost)
+                    pos_idx = network.exit_layers.index(final_layer)
+                    exit_stats.update(pos_idx, is_correct, cost)
 
     return exit_stats.get_metrics()
 
@@ -259,6 +273,7 @@ def main():
         "--checkpoint", type=str, default="best_model.pt", help="Path to model checkpoint"
     )
     parser.add_argument("--config", type=str, default=None, help="Path to config file (optional)")
+    parser.add_argument("--output_dir", type=str, default=None, help="Directory to save CSV/JSON results")
     args = parser.parse_args()
 
     # Load model
@@ -291,6 +306,7 @@ def main():
         )
 
     cost_per_layer = config["cost"]["cost_per_layer"]
+    output_dir = args.output_dir or config.get("evaluation", {}).get("output_dir", "results")
 
     # Initialize W&B for logging results
     if config["wandb"]["enabled"]:
@@ -303,6 +319,7 @@ def main():
         )
 
     results = {}
+    max_cost = sum(cost_per_layer)
 
     # Evaluate learned routing
     if routing_module is not None:
@@ -310,7 +327,7 @@ def main():
         metrics = evaluate_learned_routing(network, routing_module, test_loader, cost_per_layer, device)
         results["learned_routing"] = metrics
         print(f"  Accuracy: {metrics['overall_accuracy']:.4f}")
-        print(f"  Avg Cost: {metrics['avg_cost']:.4f}")
+        print(f"  Avg Cost: {metrics['avg_cost']:.4f} (norm={metrics['avg_cost']/max_cost:.4f})")
         print(f"  Accuracy/Cost: {metrics['accuracy_per_cost']:.4f}")
 
     # Evaluate oracle baselines
@@ -318,12 +335,12 @@ def main():
     print("Oracle Baselines:")
     print("=" * 50)
 
-    for exit_idx in network.exit_layers:
-        print(f"\nAlways Exit {exit_idx}...")
-        metrics = evaluate_oracle_always_exit(network, test_loader, exit_idx, cost_per_layer, device)
-        results[f"oracle_exit_{exit_idx}"] = metrics
+    for exit_layer in network.exit_layers:
+        print(f"\nAlways Exit {exit_layer}...")
+        metrics = evaluate_oracle_always_exit(network, test_loader, exit_layer, cost_per_layer, device)
+        results[f"oracle_exit_{exit_layer}"] = metrics
         print(f"  Accuracy: {metrics['overall_accuracy']:.4f}")
-        print(f"  Avg Cost: {metrics['avg_cost']:.4f}")
+        print(f"  Avg Cost: {metrics['avg_cost']:.4f} (norm={metrics['avg_cost']/max_cost:.4f})")
         print(f"  Accuracy/Cost: {metrics['accuracy_per_cost']:.4f}")
 
     # Random baseline
@@ -331,7 +348,7 @@ def main():
     metrics = evaluate_oracle_random(network, test_loader, cost_per_layer, device)
     results["oracle_random"] = metrics
     print(f"  Accuracy: {metrics['overall_accuracy']:.4f}")
-    print(f"  Avg Cost: {metrics['avg_cost']:.4f}")
+    print(f"  Avg Cost: {metrics['avg_cost']:.4f} (norm={metrics['avg_cost']/max_cost:.4f})")
     print(f"  Accuracy/Cost: {metrics['accuracy_per_cost']:.4f}")
 
     # Confidence-based baseline
@@ -342,8 +359,40 @@ def main():
     )
     results["oracle_confidence"] = metrics
     print(f"  Accuracy: {metrics['overall_accuracy']:.4f}")
-    print(f"  Avg Cost: {metrics['avg_cost']:.4f}")
+    print(f"  Avg Cost: {metrics['avg_cost']:.4f} (norm={metrics['avg_cost']/max_cost:.4f})")
     print(f"  Accuracy/Cost: {metrics['accuracy_per_cost']:.4f}")
+
+    # Compute normalized cost and persist results
+    for method, m in results.items():
+        if "avg_cost" in m and max_cost > 0:
+            m["avg_cost_normalized"] = m["avg_cost"] / max_cost
+
+    # Save CSV/JSON
+    from pathlib import Path
+    import json, csv, time
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    csv_path = out_dir / f"evaluation_{stamp}.csv"
+    json_path = out_dir / f"evaluation_{stamp}.json"
+
+    fieldnames = ["method", "overall_accuracy", "avg_cost", "avg_cost_normalized", "accuracy_per_cost"]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for method, m in results.items():
+            writer.writerow({
+                "method": method,
+                "overall_accuracy": m.get("overall_accuracy"),
+                "avg_cost": m.get("avg_cost"),
+                "avg_cost_normalized": m.get("avg_cost_normalized"),
+                "accuracy_per_cost": m.get("accuracy_per_cost"),
+            })
+
+    with open(json_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    print(f"\nSaved results to: {csv_path} and {json_path}")
 
     # Log all results to W&B
     if config["wandb"]["enabled"]:
@@ -352,20 +401,41 @@ def main():
             for metric_name, value in metrics.items():
                 wandb.log({f"{method}/{metric_name}": value})
 
+        # Optionally upload outputs as artifacts
+        try:
+            art = wandb.Artifact("evaluation_results", type="results")
+            art.add_file(str(csv_path))
+            art.add_file(str(json_path))
+            wandb.log_artifact(art)
+        except Exception:
+            pass
+
         wandb.finish()
 
     # Print summary comparison
     print("\n" + "=" * 50)
     print("Summary:")
     print("=" * 50)
-    print(f"{'Method':<25} {'Accuracy':<12} {'Cost':<12} {'Acc/Cost':<12}")
+    print(f"{'Method':<25} {'Accuracy':<12} {'Cost':<12} {'Acc/Cost':<12} {'NormCost':<10}")
     print("-" * 50)
 
     for method, metrics in results.items():
         acc = metrics['overall_accuracy']
         cost = metrics['avg_cost']
         acc_per_cost = metrics['accuracy_per_cost']
-        print(f"{method:<25} {acc:<12.4f} {cost:<12.4f} {acc_per_cost:<12.4f}")
+        print(f"{method:<25} {acc:<12.4f} {cost:<12.4f} {acc_per_cost:<12.4f} {cost/max_cost:<10.4f}")
+
+    # If learned routing present, show savings vs final-exit baseline
+    if 'learned_routing' in results:
+        final_key = f"oracle_exit_{network.exit_layers[-1]}"
+        if final_key in results:
+            lr_cost = results['learned_routing']['avg_cost']
+            final_cost = results[final_key]['avg_cost']
+            abs_saving = final_cost - lr_cost
+            rel_saving = abs_saving / final_cost if final_cost > 0 else 0.0
+            print("\nSavings vs Always Final:")
+            print(f"  Absolute: {abs_saving:.4f} cost units")
+            print(f"  Relative: {rel_saving*100:.2f}%")
 
     print("\nEvaluation complete!")
 

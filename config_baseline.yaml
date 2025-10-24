@@ -108,7 +108,7 @@ evaluation:
 
 # Weights & Biases configuration
 wandb:
-  enabled: false  # Disable for initial testing
+  enabled: true  # Disable for initial testing
   project: "MIDAS-CICIDS2017"
   entity: null
 

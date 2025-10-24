@@ -69,6 +69,9 @@ cost:
   # Lower lambda = prioritize accuracy
   lambda: 0.15  # Balanced cost-accuracy tradeoff
 
+  # Print a FLOPs profile derived from architecture (optional)
+  print_flops_profile: true
+
 # Training configuration
 training:
   # IMPORTANT: Load baseline checkpoint
@@ -140,9 +143,12 @@ evaluation:
     - "accuracy_per_cost"
     - "cost_accuracy_tradeoff"
 
+  # Where to save evaluation outputs (CSV/JSON)
+  output_dir: "results"
+
 # Weights & Biases configuration
 wandb:
-  enabled: false  # Disable for initial testing
+  enabled: true  # Disable for initial testing
   project: "MIDAS-CICIDS2017"
   entity: null
 
@@ -158,3 +164,5 @@ wandb:
   log_interval: 50
 
   save_checkpoints: true
+  # Avoid overwriting your baseline: choose a distinct filename
+  checkpoint_name: "routing_best.pt"
